@@ -5,9 +5,12 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"math/big"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -302,6 +305,89 @@ func (b *GethStatusBackend) startNodeWithAccount(acc multiaccounts.Account, pass
 	if err != nil {
 		return err
 	}
+	return nil
+}
+
+func getKeyFilePathsByAddresses(keyStoreDir string, addresses map[string]struct{}) ([]string, error) {
+	paths := []string{}
+
+	checkFile := func(path string, fileInfo os.FileInfo) error {
+		if fileInfo.IsDir() || filepath.Dir(path) != keyStoreDir {
+			return nil
+		}
+
+		rawKeyFile, err := ioutil.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("invalid account key file: %v", err)
+		}
+
+		var accountKey struct {
+			Address string `json:"address"`
+		}
+		if err := json.Unmarshal(rawKeyFile, &accountKey); err != nil {
+			return fmt.Errorf("failed to read key file: %s", err)
+		}
+
+		address := types.HexToAddress("0x" + accountKey.Address).Hex()
+		if _, ok := addresses[address]; ok {
+			paths = append(paths, path)
+		}
+
+		return nil
+	}
+
+	err := filepath.Walk(keyStoreDir, func(path string, fileInfo os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		return checkFile(path, fileInfo)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cannot traverse key store folder: %v", err)
+	}
+
+	return paths, nil
+}
+
+func (b *GethStatusBackend) MigrateKeyStoreDir(acc multiaccounts.Account, password, oldDir, newDir string) error {
+	err := b.ensureAppDBOpened(acc, password)
+	if err != nil {
+		return err
+	}
+
+	accountDB := accounts.NewDB(b.appDB)
+	accounts, err := accountDB.GetAccounts()
+	if err != nil {
+		return err
+	}
+
+	settings, err := accountDB.GetSettings()
+	if err != nil {
+		return err
+	}
+
+	addresses := map[string]struct{}{}
+	addresses[settings.EIP1581Address.Hex()] = struct{}{}
+	addresses[settings.WalletRootAddress.Hex()] = struct{}{}
+
+	for _, account := range accounts {
+		addresses[account.Address.Hex()] = struct{}{}
+	}
+
+	paths, err := getKeyFilePathsByAddresses(oldDir, addresses)
+	if err != nil {
+		return err
+	}
+
+	for _, path := range paths {
+		_, fileName := filepath.Split(path)
+		newPath := filepath.Join(newDir, fileName)
+		err := os.Rename(path, newPath)
+		if err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
